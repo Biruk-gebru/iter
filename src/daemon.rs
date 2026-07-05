@@ -35,6 +35,27 @@ pub async fn run() -> Result<(), String> {
     }
 
     let registry = server::new_registry();
+
+    let persisted = crate::state::load().await;
+    if !persisted.is_empty() {
+        let mut log = daemon_log.lock().await;
+        log.write_line(&format!(
+            "reconciling {} server(s) from previous run",
+            persisted.len()
+        ))
+        .await;
+        drop(log);
+        server::reconcile(&registry, persisted, daemon_log.clone()).await;
+    }
+
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            logs::rotate_server_logs().await;
+        }
+    });
+
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     loop {
