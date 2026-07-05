@@ -10,8 +10,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::logs::LogWriter;
+use crate::paths;
 use crate::protocol::ServerInfo;
+use crate::state::{self, PersistedServer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -91,6 +92,90 @@ impl ServerEntry {
             Status::Running
         )
     }
+
+    pub fn snapshot(&self) -> PersistedServer {
+        let shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        PersistedServer {
+            name: self.config.name.clone(),
+            stable_port: self.config.stable_port,
+            idle_secs: self.config.idle.as_secs(),
+            cwd: self.config.cwd.to_string_lossy().to_string(),
+            port_env: self.config.port_env.clone(),
+            command: self.config.command.clone(),
+            status: shared.status.as_str().to_string(),
+            backend_port: shared.backend_port,
+            pid: shared.pid,
+        }
+    }
+}
+
+/// Checks whether a process with the given pid is still alive, without
+/// requiring us to own it as a child (used to detect orphaned backends
+/// left behind by a previous daemon that died or was killed).
+fn pid_alive(pid: u32) -> bool {
+    // Signal 0 performs no action but still fails with ESRCH if the pid
+    // doesn't exist, which is the standard way to probe liveness.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+fn kill_pid(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+/// Owns either a real child process we spawned, or just the pid of an
+/// orphan adopted from a previous daemon run. The orphan variant can't be
+/// `wait()`-ed on directly since we never had a `Child` handle for it, so
+/// its liveness is polled instead.
+enum ChildHandle {
+    Owned(Child),
+    Orphan(u32),
+}
+
+impl ChildHandle {
+    /// Waits for the process to exit. For an owned child this is a real
+    /// `wait()`; for an adopted orphan it's a bounded liveness poll, since
+    /// there is no portable "notify me when this arbitrary pid exits"
+    /// primitive without owning the process.
+    async fn wait(&mut self) {
+        match self {
+            ChildHandle::Owned(c) => {
+                let _ = c.wait().await;
+            }
+            ChildHandle::Orphan(pid) => loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if !pid_alive(*pid) {
+                    return;
+                }
+            },
+        }
+    }
+
+    fn start_kill(&mut self) {
+        match self {
+            ChildHandle::Owned(c) => {
+                let _ = c.start_kill();
+            }
+            ChildHandle::Orphan(pid) => kill_pid(*pid),
+        }
+    }
+
+    async fn reap(&mut self) {
+        match self {
+            ChildHandle::Owned(c) => {
+                let _ = tokio::time::timeout(Duration::from_secs(3), c.wait()).await;
+            }
+            ChildHandle::Orphan(pid) => {
+                for _ in 0..30 {
+                    if !pid_alive(*pid) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
 }
 
 fn substitute_port(tokens: &[String], port: u16) -> Vec<String> {
@@ -167,10 +252,27 @@ pub async fn launch(
     cmd.current_dir(&config.cwd);
     cmd.env(&config.port_env, backend_port.to_string());
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
 
-    let mut child = match cmd.spawn() {
+    // Redirect stdout/stderr straight to the log file's own file descriptor
+    // rather than piping them through the daemon and copying bytes over in
+    // a pump task. This is deliberate: if stdout/stderr were piped, the
+    // read end lives in *our* process, so if the daemon dies (crash, `kill
+    // -9`) the child's write end becomes a broken pipe and the child can
+    // wedge or crash the next time it tries to log a line — exactly the
+    // kind of failure this adoption feature exists to survive. A direct
+    // file redirection has no reader to lose; the child keeps writing to
+    // disk regardless of whether our daemon is alive.
+    let (stdout_stdio, stderr_stdio) = match open_log_stdio(&config.name) {
+        Ok(v) => v,
+        Err(e) => {
+            drop(stable_listener);
+            return Err(StartError::Other(e));
+        }
+    };
+    cmd.stdout(stdout_stdio);
+    cmd.stderr(stderr_stdio);
+
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             drop(stable_listener);
@@ -181,23 +283,7 @@ pub async fn launch(
     };
     let pid = child.id();
 
-    let log_writer = match LogWriter::open(&config.name).await {
-        Ok(w) => Arc::new(AsyncMutex::new(w)),
-        Err(e) => {
-            let _ = child.start_kill();
-            drop(stable_listener);
-            return Err(StartError::Other(e));
-        }
-    };
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    if let Some(out) = stdout {
-        spawn_log_pump(out, log_writer.clone(), "out");
-    }
-    if let Some(err) = stderr {
-        spawn_log_pump(err, log_writer.clone(), "err");
-    }
+    let mut child_handle = ChildHandle::Owned(child);
 
     let (stop_tx, stop_rx) = oneshot::channel();
     let entry = Arc::new(ServerEntry {
@@ -217,17 +303,18 @@ pub async fn launch(
         // Re-check for a racing concurrent start with the same name/port
         // that landed while we were spawning the process.
         if map.contains_key(&entry.config.name) {
-            let _ = child.start_kill();
+            child_handle.start_kill();
             drop(stable_listener);
             return Err(StartError::NameInUse);
         }
         map.insert(entry.config.name.clone(), entry.clone());
     }
+    persist(registry, &daemon_log).await;
 
     tokio::spawn(supervise(
         entry.clone(),
         stable_listener,
-        child,
+        child_handle,
         stop_rx,
         registry.clone(),
         daemon_log,
@@ -236,24 +323,124 @@ pub async fn launch(
     Ok(entry)
 }
 
-fn spawn_log_pump<R>(reader: R, writer: Arc<AsyncMutex<LogWriter>>, stream_name: &'static str)
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let mut lines = BufReader::new(reader).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    let mut w = writer.lock().await;
-                    w.write_line(&format!("[{stream_name}] {line}")).await;
-                }
-                Ok(None) => break,
-                Err(_) => break,
-            }
+/// Re-registers a backend process that was left running by a previous
+/// daemon instance (detected via the persisted state file at startup). We
+/// never had a `Child` handle for it, so it's monitored by pid liveness
+/// instead of `wait()`, and its stdout/stderr are not recaptured (they were
+/// already redirected to its log file by the daemon that originally spawned
+/// it, or are simply lost if that daemon didn't persist far enough).
+pub async fn adopt(
+    registry: &Registry,
+    config: ServerConfig,
+    backend_port: u16,
+    pid: u32,
+    daemon_log: Arc<AsyncMutex<crate::logs::LogWriter>>,
+) {
+    let name = config.name.clone();
+    let stable_listener = match TcpListener::bind(("127.0.0.1", config.stable_port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            let mut log = daemon_log.lock().await;
+            log.write_line(&format!(
+                "[{name}] could not reclaim stable port {} for orphaned pid {pid} (left running, unmanaged): {e}",
+                config.stable_port
+            ))
+            .await;
+            insert_inert(registry, config, Status::Crashed, Some(backend_port), None).await;
+            return;
         }
+    };
+
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let entry = Arc::new(ServerEntry {
+        config,
+        shared: StdMutex::new(SharedInfo {
+            status: Status::Running,
+            backend_port: Some(backend_port),
+            pid: Some(pid),
+        }),
+        last_activity: StdMutex::new(Instant::now()),
+        stop_tx: StdMutex::new(Some(stop_tx)),
+        stopping: AtomicBool::new(false),
     });
+
+    {
+        let mut map = registry.lock().await;
+        map.insert(name.clone(), entry.clone());
+    }
+    {
+        let mut log = daemon_log.lock().await;
+        log.write_line(&format!(
+            "[{name}] reclaimed orphaned process pid {pid} on backend port {backend_port} after daemon restart"
+        ))
+        .await;
+    }
+
+    tokio::spawn(supervise(
+        entry,
+        stable_listener,
+        ChildHandle::Orphan(pid),
+        stop_rx,
+        registry.clone(),
+        daemon_log,
+    ));
+}
+
+/// Registers a server entry that is not currently running (already
+/// stopped, idle-killed, or crashed) without spawning any supervisor task.
+/// Used when reconciling persisted state for servers that weren't left
+/// with a live backend process.
+pub async fn insert_inert(
+    registry: &Registry,
+    config: ServerConfig,
+    status: Status,
+    backend_port: Option<u16>,
+    pid: Option<u32>,
+) {
+    let name = config.name.clone();
+    let entry = Arc::new(ServerEntry {
+        config,
+        shared: StdMutex::new(SharedInfo {
+            status,
+            backend_port,
+            pid,
+        }),
+        last_activity: StdMutex::new(Instant::now()),
+        stop_tx: StdMutex::new(None),
+        stopping: AtomicBool::new(false),
+    });
+    let mut map = registry.lock().await;
+    map.insert(name, entry);
+}
+
+/// Best-effort persistence: failures are logged but never propagated,
+/// since the in-memory registry stays authoritative for the current daemon
+/// run regardless of whether the on-disk mirror could be updated.
+async fn persist(registry: &Registry, daemon_log: &Arc<AsyncMutex<crate::logs::LogWriter>>) {
+    if let Err(e) = state::save(registry).await {
+        let mut log = daemon_log.lock().await;
+        log.write_line(&format!("failed to persist state: {e}"))
+            .await;
+    }
+}
+
+/// Opens two independent, append-mode file descriptors onto the same
+/// per-server log file for the child's stdout and stderr. Two separate
+/// `O_APPEND` file descriptors on the same file are safe to write from
+/// concurrently — each `write()` atomically seeks to the current end of
+/// file first — so stdout and stderr lines interleave correctly without a
+/// pump task or in-process buffering.
+fn open_log_stdio(name: &str) -> Result<(Stdio, Stdio), String> {
+    let path = paths::server_log_path(name)?;
+    let open_one = || -> Result<Stdio, String> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map(Stdio::from)
+            .map_err(|e| format!("failed to open log file {path:?}: {e}"))
+    };
+    Ok((open_one()?, open_one()?))
 }
 
 enum StopReason {
@@ -265,7 +452,7 @@ enum StopReason {
 async fn supervise(
     entry: Arc<ServerEntry>,
     listener: TcpListener,
-    mut child: Child,
+    mut child: ChildHandle,
     mut stop_rx: oneshot::Receiver<()>,
     registry: Registry,
     daemon_log: Arc<AsyncMutex<crate::logs::LogWriter>>,
@@ -302,15 +489,12 @@ async fn supervise(
                     break StopReason::Idle;
                 }
             }
-            status = child.wait() => {
+            _ = child.wait() => {
                 if entry.stopping.load(Ordering::SeqCst) {
                     break StopReason::Stopped;
                 }
                 let mut log = daemon_log.lock().await;
-                match status {
-                    Ok(s) => log.write_line(&format!("[{}] process exited: {s}", entry.config.name)).await,
-                    Err(e) => log.write_line(&format!("[{}] wait() failed: {e}", entry.config.name)).await,
-                }
+                log.write_line(&format!("[{}] process exited", entry.config.name)).await;
                 break StopReason::Crashed;
             }
             _ = &mut stop_rx => {
@@ -320,8 +504,8 @@ async fn supervise(
     };
 
     entry.stopping.store(true, Ordering::SeqCst);
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+    child.start_kill();
+    child.reap().await;
     drop(listener);
 
     let new_status = match reason {
@@ -335,13 +519,11 @@ async fn supervise(
         shared.pid = None;
     }
 
-    if matches!(new_status, Status::Crashed) {
-        // A crashed process leaves the name/port reserved but idle; the
-        // registry entry is kept so `iter restart` and `iter list` still
-        // see it, matching how idle-kill and explicit stop behave.
-        let map = registry.lock().await;
-        debug_assert!(map.contains_key(&entry.config.name));
-    }
+    // The registry entry (running, idle-killed, stopped, or crashed) is
+    // kept either way so `iter restart` and `iter list` still see it, and
+    // the on-disk mirror reflects the transition immediately in case the
+    // daemon itself goes away before the next change.
+    persist(&registry, &daemon_log).await;
 }
 
 struct ActivityHandle(Arc<ServerEntry>);
@@ -431,4 +613,56 @@ pub async fn stop(entry: &Arc<ServerEntry>) -> Result<(), String> {
         }
         None => Ok(()),
     }
+}
+
+/// Reconciles persisted state from a previous daemon run against reality.
+/// For each persisted server: if it was running and its pid is still alive,
+/// the backend process is an orphan left behind by a dead daemon and gets
+/// re-adopted (its stable port is re-bound and it's supervised again); if
+/// its pid is gone, it's registered as `crashed`; anything already
+/// inactive (stopped/idle-killed/crashed) is registered as-is. Called once
+/// at daemon startup, before the control socket starts accepting requests.
+pub async fn reconcile(
+    registry: &Registry,
+    persisted: Vec<PersistedServer>,
+    daemon_log: Arc<AsyncMutex<crate::logs::LogWriter>>,
+) {
+    for p in persisted {
+        let config = ServerConfig {
+            name: p.name,
+            stable_port: p.stable_port,
+            idle: Duration::from_secs(p.idle_secs),
+            cwd: PathBuf::from(p.cwd),
+            port_env: p.port_env,
+            command: p.command,
+        };
+
+        if p.status == Status::Running.as_str() {
+            match (p.pid, p.backend_port) {
+                (Some(pid), Some(backend_port)) if pid_alive(pid) => {
+                    adopt(registry, config, backend_port, pid, daemon_log.clone()).await;
+                }
+                _ => {
+                    let mut log = daemon_log.lock().await;
+                    log.write_line(&format!(
+                        "[{}] was running before daemon restart but its process is gone; marking crashed",
+                        config.name
+                    ))
+                    .await;
+                    drop(log);
+                    insert_inert(registry, config, Status::Crashed, p.backend_port, None).await;
+                }
+            }
+            continue;
+        }
+
+        let status = match p.status.as_str() {
+            "idle-killed" => Status::IdleKilled,
+            "crashed" => Status::Crashed,
+            _ => Status::Stopped,
+        };
+        insert_inert(registry, config, status, p.backend_port, None).await;
+    }
+
+    persist(registry, &daemon_log).await;
 }
