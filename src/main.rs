@@ -4,6 +4,7 @@ mod logs;
 mod paths;
 mod protocol;
 mod server;
+mod state;
 
 use clap::{Parser, Subcommand};
 use protocol::{Request, Response, StartRequest};
