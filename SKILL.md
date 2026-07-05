@@ -105,3 +105,26 @@ state during troubleshooting).
 - `iter start`/`iter restart` return a non-zero exit code with a message on
   `stderr` on failure (name conflict, port conflict, bad command, etc.) —
   check the exit code before assuming the server came up.
+
+## Surviving a daemon crash or reboot
+
+The daemon persists every server's config and last-known status to
+`~/.iter/state.json` after every change (start, stop, restart, idle-kill,
+crash). If the daemon itself dies unexpectedly (crash, `kill -9`, machine
+reboot), the next `iter` command transparently starts a fresh daemon, which
+reads that file and reconciles it against reality before accepting any
+requests:
+
+- if a server was `running` and its pid is still alive, the daemon
+  **re-adopts** it — re-binding the same stable port and resuming the
+  proxy/idle-tracking against the still-running backend, with no
+  interruption to already-open connections beyond the brief window while
+  the new daemon starts.
+- if a server was `running` but its pid is gone, it's marked `crashed` —
+  visible via `iter list`, restartable via `iter restart`.
+- servers that were already `stopped`/`idle-killed`/`crashed` stay that way.
+
+Per-server logs are written directly by the child process to its log file
+(not piped through the daemon), specifically so an adopted backend's
+logging keeps working even though the daemon that originally spawned it is
+gone.
