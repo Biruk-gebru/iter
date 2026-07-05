@@ -19,21 +19,14 @@ pub struct LogWriter {
 }
 
 impl LogWriter {
-    pub async fn open(name: &str) -> Result<Self, String> {
-        let path = paths::server_log_path(name)?;
-        let old_path = paths::server_log_old_path(name)?;
-        Self::open_at_with_old(path, old_path).await
-    }
-
     /// Opens a log file at an arbitrary path (used for the daemon's own
-    /// log, which isn't tied to a managed server name).
+    /// log; per-server logs are written directly by the child process, not
+    /// through a `LogWriter` — see `open_log_stdio` in `server.rs`).
     pub async fn open_at(path: &Path) -> Result<Self, String> {
-        let mut old_path = path.as_os_str().to_os_string();
-        old_path.push(".old");
-        Self::open_at_with_old(path.to_path_buf(), PathBuf::from(old_path)).await
-    }
-
-    async fn open_at_with_old(path: PathBuf, old_path: PathBuf) -> Result<Self, String> {
+        let mut old_os = path.as_os_str().to_os_string();
+        old_os.push(".old");
+        let old_path = PathBuf::from(old_os);
+        let path = path.to_path_buf();
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -85,6 +78,63 @@ impl LogWriter {
         {
             self.file = f;
         }
+    }
+}
+
+/// Periodically rotates any per-server log file that has grown past the
+/// size cap. Per-server logs are written directly by the child process's
+/// own file descriptor (not through `LogWriter`), so they can't be rotated
+/// by renaming — the child's fd would keep writing into the renamed file,
+/// not a fresh one. Instead the current content is copied to `.old` and
+/// the file is truncated in place with `set_len(0)`, which every existing
+/// `O_APPEND` writer (including a managed child) sees correctly on its
+/// next write, since the kernel recomputes the append offset from the
+/// file's current length each time.
+pub async fn rotate_server_logs() {
+    let dir = match paths::logs_dir() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let mut entries = match fs::read_dir(&dir).await {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "log") {
+            continue;
+        }
+        let meta = match fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.len() >= MAX_LOG_BYTES {
+            rotate_in_place(&path).await;
+        }
+    }
+}
+
+async fn rotate_in_place(path: &Path) {
+    let mut old_os = path.as_os_str().to_os_string();
+    old_os.push(".old");
+    let old_path = PathBuf::from(old_os);
+
+    // Best-effort: any failure here just leaves the oversized file in
+    // place for the next rotation pass rather than losing log data.
+    let contents = match fs::read(path).await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if fs::write(&old_path, &contents).await.is_err() {
+        return;
+    }
+    if let Ok(f) = OpenOptions::new().write(true).open(path).await {
+        let _ = f.set_len(0).await;
     }
 }
 
