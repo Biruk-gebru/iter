@@ -2,6 +2,9 @@
 name = "iter"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Supervise local dev servers behind stable proxy ports; idle-kill on real traffic, never auto-restart."
+repository = "https://github.com/Biruk-gebru/iter"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "time", "fs"] }
