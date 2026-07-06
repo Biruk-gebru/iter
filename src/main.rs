@@ -1,5 +1,6 @@
 mod client;
 mod daemon;
+mod init_agent;
 mod logs;
 mod paths;
 mod protocol;
@@ -9,10 +10,31 @@ mod state;
 use clap::{Parser, Subcommand};
 use protocol::{Request, Response, StartRequest};
 
+const AGENTS_MD: &str = include_str!("../AGENTS.md");
+
 #[derive(Parser)]
 #[command(
     name = "iter",
-    about = "Supervise local dev servers behind stable proxy ports"
+    version,
+    about = "Supervise local dev servers behind stable proxy ports",
+    long_about = "iter runs local dev servers (npm run dev, cargo run, python \
+manage.py runserver, ...) behind a stable proxy port that never changes across \
+restarts, kills them after real network idleness (never a fixed timer), and \
+never auto-restarts a killed server.\n\nThere is no separate daemon-management \
+step: any command below starts the background daemon automatically on first \
+use.",
+    after_help = "EXAMPLES:\n    \
+    iter start web --port 5173 -- npm run dev\n    \
+    iter start api --port 8000 --idle 15 -- python manage.py runserver {port}\n    \
+    iter list\n    \
+    iter logs web -n 200\n    \
+    iter restart web\n    \
+    iter stop web\n    \
+    iter init-agent\n\n\
+For coding-agent integration (Claude Code, Codex, etc.), run `iter agents` for \
+embedded usage docs, or `iter init-agent` to wire them into your agent's config \
+automatically.\n\n\
+Docs: https://github.com/Biruk-gebru/iter"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -59,10 +81,32 @@ enum Command {
     /// Stop every managed server and the daemon itself.
     #[command(name = "shutdown-all")]
     ShutdownAll,
+    /// Print embedded usage docs for coding agents (Claude Code, Codex, etc).
+    Agents,
+    /// Wire iter usage instructions into your coding agent's config.
+    #[command(name = "init-agent")]
+    InitAgent {
+        /// Write to this project's AGENTS.md instead of your global agent config.
+        #[arg(long)]
+        project: bool,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    if matches!(cli.command, Command::Agents) {
+        print!("{AGENTS_MD}");
+        return;
+    }
+
+    if let Command::InitAgent { project } = cli.command {
+        if let Err(e) = init_agent::run(project) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if matches!(cli.command, Command::Daemon) {
         let rt = match tokio::runtime::Runtime::new() {
@@ -97,7 +141,9 @@ async fn run_client(command: Command) -> Result<(), String> {
     client::ensure_daemon().await?;
 
     let request = match command {
-        Command::Daemon => unreachable!("handled before entering async client path"),
+        Command::Daemon | Command::Agents | Command::InitAgent { .. } => {
+            unreachable!("handled before entering async client path")
+        }
         Command::Start {
             name,
             port,
